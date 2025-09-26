@@ -61,16 +61,16 @@ This is especially useful for running BOOM on HPC systems where Docker is not av
     This may take a couple of minutes the first time you run it, as it needs to download the docker image for each service.
     *To check if the containers are running and healthy, run `docker ps`.*
 
-3. Launch `Valkey`, `MongoDB`, and `Kafka` using Apptainer:
+3. Launch `Valkey`, `MongoDB`, `Kafka`, `Otel Collector`, `Prometheus` and `boom` using Apptainer:
     First, build the SIF files. You can do this by running:
     ```bash
     ./apptainer/def/build-sif.sh
     ```
     Then you can launch the services with:
     ```bash
-    ./apptainer_compose.sh
+    ./apptainer.sh compose
     ```
-    *To check if the instances are running and healthy, run `./apptainer_healthchecks.sh`.*
+    *To check if the instances are running and healthy, run `./apptainer.sh health`.*
 4. Last but not least, build the Rust binaries. You can do this with or without the `--release` flag, but we recommend using it for better performance:
     ```bash
     cargo build --release
@@ -86,7 +86,7 @@ then call:
 make api-dev
 ```
 
-## Running BOOM:
+## Running BOOM for development
 
 ### Alert Production (not required for production use)
 
@@ -142,6 +142,40 @@ For example, to process ZTF alerts, you can run:
 cargo run --release --bin scheduler ztf
 ```
 
+## Running BOOM in production
+
+### Using Docker
+To run the consumer and the scheduler with Docker, you can open a shell in the `boom` container with:
+```bash
+docker exec -it -w /app boom /bin/bash
+```
+Then you can run the binaries with:
+```bash
+./kafka_consumer <SURVEY> [DATE] [PROGRAMID]
+./scheduler <SURVEY> [CONFIG_PATH]
+```
+Or you can run them directly with:
+```bash
+docker exec -it -w /app boom ./kafka_consumer <SURVEY> [DATE] [PROGRAMID]
+docker exec -it -w /app boom ./scheduler <SURVEY> [CONFIG_PATH]
+```
+
+### Using Apptainer
+To run the consumer and the scheduler with Apptainer, you can open a shell in the `boom` instance with:
+```bash
+apptainer shell --pwd /app instance://boom
+```
+Then you can run the binaries with:
+```bash
+./kafka_consumer <SURVEY> [DATE] [PROGRAMID]
+./scheduler <SURVEY> [CONFIG_PATH]
+```
+Or you can run them directly with:
+```bash
+apptainer exec instance://boom /app/kafka_consumer <SURVEY> [DATE] [PROGRAMID]
+apptainer exec instance://boom /app/scheduler <SURVEY> [CONFIG_PATH]
+```
+
 The scheduler prints a variety of messages to your terminal, e.g.:
 - At the start you should see a bunch of `Processed alert with candid: <alert_candid>, queueing for classification` messages, which means that the fake alert worker is picking up on the alerts, processed them, and is queueing them for classification.
 - You should then see some `received alerts len: <nb_alerts>` messages, which means that the enrichment worker is processing the alerts successfully.
@@ -170,6 +204,10 @@ To stop BOOM, you can simply stop the `Kafka` consumer with `CTRL+C`, and then s
 You can also stop the docker containers with:
 ```bash
 docker compose down
+```
+Or stop the Apptainer instances with:
+```bash
+./apptainer.sh stop
 ```
 
 When you stop the scheduler, it will attempt to gracefully stop all the workers by sending them interrupt signals.
@@ -203,21 +241,19 @@ RUST_LOG=debug,ort=warn BOOM_SPAN_EVENTS=new,close cargo run --bin scheduler -- 
 ## Running Benchmark
 
 This repository includes a benchmark to test the system and get an idea of the time it takes to process a certain number of alerts.
-This benchmark uses Docker to build the image and run the benchmark, but it can also be run with Apptainer using the same Docker image.
+This benchmark uses Docker to build the image and run the benchmark, but it can also be run with Apptainer.
 The step to run the benchmark are as follows:
 
-### Build Docker Image
+### Build Image
+For Docker (docker Image):
 ```bash
   docker buildx create --use
   docker buildx inspect --bootstrap
   docker buildx bake -f tests/throughput/compose.yaml --load
 ```
-
-### Create SIF files (For Apptainer only)
-To build the boom-benchmark SIF files, you will need to have the docker image built first (see previous step).
-If you don't have docker on the system where you want to run the benchmark, you can build the SIF files on another system and transfer them over.
+For Apptainer (SIF file):
 ```bash
-  ./tests/apptainer/def/build-tests-sif.sh
+  ./apptainer/def/build-sif.sh test
 ```
 
 ### Download Data
@@ -226,8 +262,7 @@ If you don't have docker on the system where you want to run the benchmark, you 
   gdown "https://drive.google.com/uc?id=1BG46oLMbONXhIqiPrepSnhKim1xfiVbB" -O ./data/alerts/kowalski.NED.json.gz
 ```
 
-### Run Benchmark
-
+### Start Benchmark
 Using Docker:
 ```bash
   uv run tests/throughput/run.py
@@ -235,7 +270,7 @@ Using Docker:
 
 Using Apptainer:
 ```bash
-  python apptainer/run.py
+  ./apptainer.sh benchmark
 ```
 
 ## Contributing

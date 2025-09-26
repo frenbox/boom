@@ -6,6 +6,5 @@ From: valkey/valkey:7.2.6
     export ALLOW_EMPTY_PASSWORD=yes
     export VALKEY_DISABLE_COMMANDS=FLUSHDB,FLUSHALL
 
-%startscript
-    # Disable persistence for benchmarking
-    exec valkey-server --save "" --appendonly no > /valkey/logs/valkey.log 2>&1
+%runscript
+    exec valkey-server --logfile /log/valkey.log --dir /data

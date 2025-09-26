@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Valkey health check
+# Uptime Kuma health check
 # $1 = NB_RETRIES max retries (empty = unlimited)
 
 current_datetime() {
@@ -14,15 +14,15 @@ END="\e[0m"
 NB_RETRIES=${1:-}
 
 cpt=0
-until timeout 3 apptainer exec instance://valkey redis-cli ping 2>/dev/null | grep -q PONG; do
-    echo -e "${RED}$(current_datetime) - Valkey unhealthy${END}"
+until timeout 3 curl -sSf http://localhost:3001 > /dev/null 2>&1; do
+    echo -e "${RED}$(current_datetime) - Uptime Kuma unhealthy${END}"
     if [ -n "$NB_RETRIES" ] && [ $cpt -ge $NB_RETRIES ]; then
-      exit 1
+        exit 1
     fi
 
     ((cpt++))
-    sleep 1
+    sleep 3
 done
 
-echo -e "${GREEN}$(current_datetime) - Valkey is healthy${END}"
+echo -e "${GREEN}$(current_datetime) - Uptime Kuma is healthy${END}"
 exit 0
