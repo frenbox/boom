@@ -26,8 +26,16 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::{instrument, trace, warn};
 #[cfg(feature = "gpu")]
 use tracing::info;
-#[cfg(feature = "gpu")]
+// Backend selection for villar-pso is per-OS, controlled by the `gpu` Cargo
+// feature. On Linux the CUDA backend lives at `villar_pso::gpu`; on macOS the
+// Metal backend lives at `villar_pso::gpu_metal`. Both expose the same
+// `GpuContext`, `GpuBatchData`, and `SourceData` types — the only API
+// difference is `GpuBatchData::new`, which is shimmed below in
+// `make_villar_batch`.
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 use villar_pso::gpu::{GpuBatchData, GpuContext, SourceData};
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+use villar_pso::gpu_metal::{GpuBatchData, GpuContext, SourceData};
 
 /// Atomic counter for round-robin GPU device assignment across worker threads.
 #[cfg(feature = "gpu")]
@@ -413,6 +421,27 @@ pub struct ZtfEnrichmentWorker {
     gpu_ctx: Option<GpuContext>,
 }
 
+/// Build a `GpuBatchData` for the active villar-pso backend.
+///
+/// The CUDA backend's `GpuBatchData::new` only takes the sources, while the
+/// Metal backend additionally requires the context. This shim absorbs the
+/// signature difference so the call site can stay backend-agnostic.
+#[cfg(all(feature = "gpu", target_os = "linux"))]
+fn make_villar_batch(
+    _ctx: &GpuContext,
+    sources: &[&SourceData],
+) -> Result<GpuBatchData, String> {
+    GpuBatchData::new(sources)
+}
+
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+fn make_villar_batch(
+    ctx: &GpuContext,
+    sources: &[&SourceData],
+) -> Result<GpuBatchData, String> {
+    GpuBatchData::new(ctx, sources)
+}
+
 #[cfg(feature = "gpu")]
 fn to_villar_photometry(p: &PhotometryMag) -> Option<villar_pso::PhotometryMag> {
     let band = match p.band {
@@ -677,7 +706,7 @@ impl EnrichmentWorker for ZtfEnrichmentWorker {
                 let source_refs: Vec<&SourceData> = sources.iter().collect();
                 let pso_config = villar_pso::PsoConfig::default();
 
-                match GpuBatchData::new(&source_refs).and_then(|batch| {
+                match make_villar_batch(gpu_ctx, &source_refs).and_then(|batch| {
                     gpu_ctx.batch_pso_multi_seed(&batch, &source_refs, &pso_config)
                 }) {
                     Ok(results) => {
