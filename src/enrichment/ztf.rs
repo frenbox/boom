@@ -21,25 +21,16 @@ use mongodb::bson::{doc, Document};
 use mongodb::options::{UpdateOneModel, WriteModel};
 use serde::{Deserialize, Deserializer};
 use std::sync::Arc;
-#[cfg(feature = "gpu")]
-use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::{instrument, trace, warn};
-#[cfg(feature = "gpu")]
-use tracing::info;
 // Backend selection for villar-pso is per-OS, controlled by the `gpu` Cargo
 // feature. On Linux the CUDA backend lives at `villar_pso::gpu`; on macOS the
-// Metal backend lives at `villar_pso::gpu_metal`. Both expose the same
-// `GpuContext`, `GpuBatchData`, and `SourceData` types — the only API
-// difference is `GpuBatchData::new`, which is shimmed below in
-// `make_villar_batch`.
+// Metal backend lives at `villar_pso::gpu_metal`. Both expose `GpuBatchData`,
+// `SourceData`, and a `GpuContext` whose construction is owned by
+// `SharedModels` (see `enrichment::models::SharedModels`).
 #[cfg(all(feature = "gpu", target_os = "linux"))]
-use villar_pso::gpu::{GpuBatchData, GpuContext, SourceData};
+use villar_pso::gpu::{GpuBatchData, SourceData};
 #[cfg(all(feature = "gpu", target_os = "macos"))]
-use villar_pso::gpu_metal::{GpuBatchData, GpuContext, SourceData};
-
-/// Atomic counter for round-robin GPU device assignment across worker threads.
-#[cfg(feature = "gpu")]
-static GPU_DEVICE_COUNTER: AtomicI32 = AtomicI32::new(0);
+use villar_pso::gpu_metal::{GpuBatchData, SourceData};
 
 #[serdavro]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -410,36 +401,12 @@ pub struct ZtfEnrichmentWorker {
     alert_collection: mongodb::Collection<Document>,
     alert_cutout_collection: mongodb::Collection<Document>,
     alert_pipeline: Vec<Document>,
-    /// Shared ONNX models (loaded once, shared across all enrichment workers via Arc).
+    /// Shared ONNX models (loaded once, shared across all enrichment workers
+    /// via Arc). On Linux+`gpu` this also owns the per-device CUDA stream and
+    /// villar-pso `GpuContext` so that PSO and ONNX inference share a stream.
     models: Option<Arc<SharedModels>>,
     babamul: Option<Babamul>,
     gpu_enabled: bool,
-    /// Per-worker villar-pso GPU context. `Some` only when `config.gpu.enabled`
-    /// is true and the binary was built with the `gpu` feature. Workers are
-    /// round-robin-assigned a device from `config.gpu.device_ids` at init time.
-    #[cfg(feature = "gpu")]
-    gpu_ctx: Option<GpuContext>,
-}
-
-/// Build a `GpuBatchData` for the active villar-pso backend.
-///
-/// The CUDA backend's `GpuBatchData::new` only takes the sources, while the
-/// Metal backend additionally requires the context. This shim absorbs the
-/// signature difference so the call site can stay backend-agnostic.
-#[cfg(all(feature = "gpu", target_os = "linux"))]
-fn make_villar_batch(
-    _ctx: &GpuContext,
-    sources: &[&SourceData],
-) -> Result<GpuBatchData, String> {
-    GpuBatchData::new(sources)
-}
-
-#[cfg(all(feature = "gpu", target_os = "macos"))]
-fn make_villar_batch(
-    ctx: &GpuContext,
-    sources: &[&SourceData],
-) -> Result<GpuBatchData, String> {
-    GpuBatchData::new(ctx, sources)
 }
 
 #[cfg(feature = "gpu")]
@@ -488,31 +455,6 @@ impl EnrichmentWorker for ZtfEnrichmentWorker {
             None => Some(SharedModels::load(None)?),
         };
 
-        // Assign a GPU device to this worker via round-robin over `config.gpu.device_ids`.
-        // Only initialize a villar-pso GpuContext when GPU usage is actually enabled at
-        // runtime; otherwise leave it `None` so this worker never touches CUDA.
-        #[cfg(feature = "gpu")]
-        let gpu_ctx: Option<GpuContext> = if config.gpu.enabled {
-            let device_ids = &config.gpu.device_ids;
-            if device_ids.is_empty() {
-                return Err(EnrichmentWorkerError::ConfigurationError(
-                    "config.gpu.enabled is true but config.gpu.device_ids is empty".to_string(),
-                ));
-            }
-            let idx = (GPU_DEVICE_COUNTER.fetch_add(1, Ordering::Relaxed) as usize)
-                % device_ids.len();
-            let device_id = device_ids[idx];
-            info!(device_id, "initializing villar-pso GPU context");
-            Some(GpuContext::new(device_id).map_err(|e| {
-                EnrichmentWorkerError::ConfigurationError(format!(
-                    "villar-pso GPU init failed for device {}: {}",
-                    device_id, e
-                ))
-            })?)
-        } else {
-            None
-        };
-
         Ok(ZtfEnrichmentWorker {
             input_queue,
             output_queue,
@@ -523,8 +465,6 @@ impl EnrichmentWorker for ZtfEnrichmentWorker {
             models,
             babamul,
             gpu_enabled: config.gpu.enabled,
-            #[cfg(feature = "gpu")]
-            gpu_ctx,
         })
     }
 
@@ -593,7 +533,12 @@ impl EnrichmentWorker for ZtfEnrichmentWorker {
             let (properties, all_bands_properties, programid, _lightcurve) =
                 self.get_alert_properties(&alert).await?;
             #[cfg(feature = "gpu")]
-            if self.gpu_ctx.is_some() {
+            if self
+                .models
+                .as_ref()
+                .and_then(|m| m.gpu_ctx.as_ref())
+                .is_some()
+            {
                 villar_inputs.push((candid, lightcurve));
             }
 
@@ -649,11 +594,15 @@ impl EnrichmentWorker for ZtfEnrichmentWorker {
 
         let _ = self.client.bulk_write(updates).await?.modified_count;
 
-        // GPU batch Villar light curve fitting — only when a villar-pso GPU
-        // context was actually initialized for this worker (i.e. config.gpu.enabled
-        // is true). Otherwise `villar_inputs` is empty and we skip the entire block.
+        // GPU batch Villar light curve fitting — only when SharedModels was
+        // loaded with a GPU device (i.e. config.gpu.enabled is true).
+        // Otherwise `villar_inputs` is empty and we skip the entire block.
         #[cfg(feature = "gpu")]
-        if let Some(gpu_ctx) = self.gpu_ctx.as_ref() {
+        if let Some(gpu_ctx) = self
+            .models
+            .as_ref()
+            .and_then(|m| m.gpu_ctx.as_ref())
+        {
             // Document whose keys match a successful fit's keys but with all values NaN.
             // Written whenever a fit can't be produced (bad photometry or GPU failure).
             let nan_set_doc = {
@@ -706,7 +655,7 @@ impl EnrichmentWorker for ZtfEnrichmentWorker {
                 let source_refs: Vec<&SourceData> = sources.iter().collect();
                 let pso_config = villar_pso::PsoConfig::default();
 
-                match make_villar_batch(gpu_ctx, &source_refs).and_then(|batch| {
+                match GpuBatchData::new(gpu_ctx, &source_refs).and_then(|batch| {
                     gpu_ctx.batch_pso_multi_seed(&batch, &source_refs, &pso_config)
                 }) {
                     Ok(results) => {
